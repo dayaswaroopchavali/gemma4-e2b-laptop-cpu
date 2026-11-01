@@ -2,7 +2,10 @@
 
 I wanted a small local language model that answers quickly on an ordinary laptop with **no GPU**: one user, one stream, short prompts, the first token as soon as possible. The obvious tools were Ollama and stock vLLM, so the goal I set was to beat both on the same machine.
 
-**This is a vibe-coding project.** I am not a kernel engineer. I set the goals and the rules, and an AI coding assistant wrote nearly all of the code. The rules I held it to are the interesting part, and they are written up in [docs/METHOD.md](docs/METHOD.md): pose each problem as a math problem, check the claim in Lean when it is arithmetic or logic, measure against a fair baseline in the same session, and write down every experiment that failed. I have not audited every line myself. Treat the numbers as one person's measurements on one laptop.
+**This is a vibe-coding project.** I am not a kernel engineer. I set the goals and the rules, and an AI coding assistant wrote nearly all of the code. The rules I held it to are the interesting part, and they are written up in [docs/METHOD.md](docs/METHOD.md): pose each problem as a math problem, check the claim in Lean when it is arithmetic or logic, measure against a fair baseline in the same session, and write down every experiment that failed. 
+I was inspired by the proofs of chatgpt for unsolved math problems and wondered if similar method of verification of the idea before building ,and this is neither model nor hardware agnostic, and not plug and play.
+
+ I have not audited every line myself. Treat the numbers as one person's measurements on one laptop.
 
 ## What came out
 
