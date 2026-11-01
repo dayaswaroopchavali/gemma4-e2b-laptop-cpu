@@ -69,7 +69,7 @@ The whole procedure, with what to change for a different CPU, is in [docs/STEPS.
 - The int8 decode path is **on by default and slightly lossy**: on my prompts it followed the exact-float output to the end on most prompts and diverged at a near-tie token on the others. `ENGINE_DECODE_INT8=0` turns it off. The measurement is in [docs/RESULTS.md](docs/RESULTS.md).
 - The server handles **text only** for now: no audio or image input, no tool-call parsing, no `n > 1`, no `logprobs`. One request runs at a time.
 - The numbers were measured on **private prompts** of the lengths listed in the results. The prompts in `bench/` are neutral stand-ins of similar lengths (20 to 6,855 tokens). Speeds depend on the text, because speculative decoding accepts more tokens on repetitive text, so expect similar but not identical numbers.
-- This machine's speed drifts by about 10% during a session. Only compare runs from the same session, which is what `bench/ab.py` does.
+- This machine's speed drifts by about 10% during a session , take results with a grain of salt.
 
 ## Licence
 
