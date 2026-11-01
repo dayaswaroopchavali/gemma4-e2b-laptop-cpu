@@ -1,0 +1,7 @@
+Summarise these six unread messages in three short bullet points.
+[09:02] Ana: Can we move the planning call to 3pm?
+[09:05] Ben: 3pm works for me, I will share the notes before.
+[09:11] Ana: Great. Also the venue booking for Friday needs a deposit.
+[09:14] Chris: I can pay the deposit today, send me the account details.
+[09:20] Ana: Sent by email. Please confirm when it is done.
+[09:31] Chris: Deposit paid, receipt attached.

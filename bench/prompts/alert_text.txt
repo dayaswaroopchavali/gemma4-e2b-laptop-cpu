@@ -1,0 +1,1 @@
+Alert: the temperature sensor in cold room 3 has read 9 degrees for the last 15 minutes, above the 4 degree limit. Write a two sentence notice for the on-call technician.

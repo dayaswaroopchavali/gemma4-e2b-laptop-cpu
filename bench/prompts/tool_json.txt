@@ -1,0 +1,1 @@
+You can call tools. Reply ONLY with a JSON object of the form {"tool": name, "args": {...}}. Tools: send_message(chat, text), set_timer(minutes, label), search_notes(query). Request: tell Priya that the delivery has moved to Thursday afternoon.

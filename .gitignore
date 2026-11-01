@@ -1,0 +1,6 @@
+models/
+bin/
+.venv/
+__pycache__/
+*.pyc
+.lake/

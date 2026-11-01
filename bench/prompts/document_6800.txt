@@ -1,0 +1,353 @@
+Read the following technical notes, then explain the three most important trade-offs in a concise answer.
+
+ch-1 C++/AVX2 engine for ONE model (google/gemma-4-E2B-it-qat-w4a16-ct) on ONE CPU
+(Ryzen 7 7730U), reusing the verified int4 g32 kernel (csrc/cpu/w4g32_avx2.h), the packed head
+(csrc/cpu/bf16_exp3_head.h) and Google's MTP drafter. vLLM stays the reference: every stage is checked
+against recorded vLLM activations before the next stage is written.
+
+## Why (measured)
+Plain vLLM step ~125 ms/token = 
+21 ms non-matmul (Python/eager/scheduler/attention/norms) + ~100 ms matmuls
+(body+head at ~16 GB/s of a ~21.5 GB/s ceiling). Byte floor ~75 ms/token plain; Ollama's 22 tok/s is speculation
+(n-max 3, acceptance 0.35) at ~zero overhead. Target needs overhead ~0, head < ~256 MB, ~2 tok/round (Lean: budget_head_cap).
+
+## Dimensions (config)
+35 layers, hidden 1536, MLP 6144 (all layers), vocab 262144 (
+ied head/embed), PLE dim 256/layer, 8 q heads, 1 kv head,
+layer_types: full_attention at layers 4,9,14,19,24,29,34 else sliding (window 512); head_dim 256 sliding / 512 full;
+last 20 layers (15..34) KV-shared: layer L reuses K/V of the last owner of the same type among layers 0..14
+(sliding -> 13, full -> 14); shared layers have only q_proj (no k/v proj, no k_norm/v_norm).
+RoPE: sliding theta 1e4 
+ope_type default full rotary; full theta 1e6 rope_type proportional, partial_rotary_factor 0.25;
+NeoX style. attention scaling = 1.0 (q_norm/k_norm carry scale), no attn softcap. final_logit_softcapping 30.0.
+rms_norm_eps 1e-6.
+
+## Per-token input
+h0 = embed_tokens[tok] * normalizer (= sqrt(1536))                          [bf16 table, tied with head]
+ple_embed = embed_tokens_per_layer[tok] * embed
+scale_per_layer (= sqrt(256)) reshaped [35,256]   [4.7 GB table, row gather]
+proj = per_layer_model_projection(h0) * per_layer_projection_scale (= 1536^-0.5), reshape [35,256], RMSNorm(per_layer_projection_norm)
+per_layer_inputs = (proj + ple_embed) * per_layer_input_scale (= 2^-0.5)
+
+## Decoder layer l (hidden_states x, per_layer_input p_l)
+r = x
+a = input_layernorm(r)
+ owner layers:  qkv = qkv_p
+oj(a) -> q [8*hd], k [hd], v [hd]
+                q = q_norm(q per head); k = k_norm(k per head); v = v_norm(v per head, NO weight)
+                (q,k) = rope(positions, q, k); write k,v to cache
+ shared layers: q = q_proj(a); q = q_norm(q per head); q = rope(q); K/V from owner layer cache
+ attn: causal; sliding layers limited to last 512 positions; scaling 1.0; GQA 8:1 -> o_proj
+x = post_attent
+on_layernorm(attn_out) + r ; r = x
+m = mlp(pre_feedforward_layernorm(x)) : gate_up_proj -> gelu_tanh(gate) * up -> down_proj
+x = post_feedforward_layernorm(m) + r
+PLE: g = gelu_tanh(per_layer_input_gate(x)) * p_l ; x = x + post_per_layer_input_norm(per_layer_projection(g))
+x = x * layer_scalar
+(RMSNorm weight form to be verified from checkpoint values before coding: vLLM comment says output = norm
+x) * weight)
+
+## Output
+x = final norm(x); logits = x @ embed_tokens^T ; logits = 30 * tanh(logits / 30); greedy argmax (lowest index on ties).
+
+## Corrections found by validating against vLLM (pyref_gemma4.py reproduces all 35 layers + first token)
+- MLP width is NOT 6144 everywhere: layers 0-14 use 6144; layers 15-34 (the KV-shared ones) use 12288 (double-wide).
+- RMSNorm is x * rsqrt(mean(x^2)+
+e-6) * weight (no 1+weight). v_norm has no weight. Residual stream is bf16 between layers.
+- Proportional RoPE (full-attention layers, head_dim 512, theta 1e6, partial 0.25): inv_freq[j] = theta^(-2j/head_dim) for the first
+  rope_angles = 64 pair-indices j, ZERO (identity) for the remaining 192 pair-indices; NeoX pairing i <-> i+head_dim/2 over the WHOLE head.
+  Sliding layers (theta 1e4, head_di
+ 256): same formula with all 128 pair-indices rotating (standard NeoX).
+- per_layer_model_projection is int4 g32 ([8960,1536]); per-layer gates/projections are int4 too; embed_tokens_per_layer is a [262144, 8960] bf16 row table.
+- Verified: per-layer max relative error vs vLLM <= 1.6% (bf16 level, not growing); final-norm 3.3%; first generated token 236770 matches (top logit 28.74 vs runner-up 25.
+1).
+
+## Build order (each stage verified bit-/tolerance-wise against recorded vLLM tensors)
+1. dump reference tensors from vLLM eager for a fixed prompt (embeddings, PLE inputs, per-layer outputs, logits).
+2. C++ RMSNorm/rope/gelu primitives vs reference.  3. one owner layer. 4. one shared layer. 5. all 35 layers + head.
+6. KV cache + attention for decode (sliding window) and prefill.  7. speculat
+ve verify loop with the MTP drafter.
+8. certified head screen. 9. audio embedding input (external encoder) and streaming prefill.
+
+
+# Method: how I worked
+
+This repository is the product of a loop, and the loop matters more than any single trick. I steered an AI coding assistant with a small set of rules. This page lists the rules, what each one found, and the mistakes it caught.
+
+## The loop
+
+1. 
+*Find the physical limit first.** Before writing any code, measure what the machine can do and compute what the model needs.
+2. **Pose each problem as a math problem.** Write down what is being optimised and what the constraints are, and look for a known result before inventing something.
+3. **Write the C++ in a low-latency style.** No allocation in the token loop, cache-line-aligned per-thread st
+te, a persistent thread pool that spins briefly and then sleeps, non-temporal prefetch for streamed weights.
+4. **Prove the core claim in Lean** when it is arithmetic or logic. Not everything can be proved (speed cannot), but "this error bound keeps the argmax exact" can.
+5. **Measure against a fair baseline in the same session.** Alternate the two builds, rotate the order, and check that the gene
+ated tokens are identical when the change is supposed to be exact.
+6. **Write down every failure.** The experiments that did not work are in [RESULTS.md](RESULTS.md), with numbers, so nobody repeats them.
+
+## Step 1: the physical limit
+
+Decoding one token reads every weight once. On this laptop a plain AVX2 read loop streams about **21.3 GB/s** whatever the page size (4 KB pages, 2 MB huge pages, 
+ mapped file all give 20.5 to 21.6 GB/s). Six threads reach 20 to 21 GB/s, eight threads about 19.3. The int4 body of the model, with its scales, is about 1,056 MB, and the screened output head adds 226 MB. So:
+
+- body only: 1,056 MB / 21.3 GB/s = **49.6 ms** per forward pass
+- body and head: about **60 to 64 ms** per forward pass
+
+Decode speed is then `tokens per round / forward time`. Two levers
+follow immediately. Reduce the bytes read per pass (the head screen, int4 everywhere), and get more tokens out of each pass (speculative decoding). Nothing else can matter much once the kernels sit at the bandwidth ceiling, and that is where they ended up: the matrix products measure 51.2 ms against a 48.5 ms floor.
+
+`bench/stream_bw.cpp` measures the ceiling on your own machine. Run it first.
+
+##
+Step 2: math problems and what they said
+
+| question | result | Lean |
+|---|---|---|
+| Is a drafted token worth its cost? | Speculation only pays when the acceptance rate exceeds the cost ratio of drafting. | `spec_needs_alpha_gt_c`, `spec_k1_iff` |
+| Should the drafter also propose a second candidate (a sibling) instead of a longer chain? | The sibling beats the chain exactly when `q2 > p1 * p2`.
+Measured: the drafter's top guess is right 59.8% of rounds and its second guess only 16.7%, so an unconditional sibling does not win. | `sibling_beats_chain_iff`, `sibling_rate_iff` |
+| Can the 262,144-row output matrix be read less often? | Yes. Screen with a small int4 copy and a radius from Cauchy-Schwarz; the true argmax can never be discarded, so the output stays exact. The screen is about 98
+ of the head's time. | `screen_keeps_argmax`, `act_quant_radius`, `head_saving_iff` |
+| Could a cheaper (3-bit or cluster) screen work? | No. 99.6% of tokens survive the cluster bound, because the head rows are nearly orthogonal in 1,536 dimensions. Measured, not proved. | none |
+| Does the int8 activation path overflow its 16-bit accumulator? | No: 4 chunks of at most 7,620 add to at most 30,480,
+below 32,767. | `w4a8_no_overflow`, `w4a8_offset_identity`, `w4a8_group_error` |
+| Can a packed bf16 head reach 31 tok/s? | No, by arithmetic: two tokens per round at 21.5 GB/s over 1,131 MB of body and drafter plus a 554 MB packed head is under 31. That is why the screen exists. | `packed_head_throughput_lt_31`, `budget_head_cap` |
+| Can partial attention results from different threads be merged 
+xactly? | Yes, with a log-sum-exp rescale of each thread's partial softmax. Checked by comparing the engine's tokens with the unsplit path. | none in this repository |
+| Can the screen's per-thread winners be combined in any order? | Yes, the best candidate of partial results is order-independent. | `partial_winner_associative` |
+| How much lag can the HTTP layer add? | At most the sum of its stag
+ times, and no queue forms while bursts are at least that far apart. | `stage_lag_le`, `two_stage_lag_le` |
+| Can streaming a stop string retract text already sent? | Not if you hold back one character fewer than the stop string. | `holdback_safe`, `slices_concat` |
+| Is reusing cached keys and values after a slot switch correct? | Yes, for a causal model, below the longest common prefix. The chos
+n slot maximises the shared prefix, and evicting never loses the active conversation. | `reuse_sound`, `best_slot_max`, `evict_parks_active` |
+| How long should an idle worker spin before it sleeps? | Spin for a budget longer than any gap inside a request; then the worst case is within `1 + tau/W` of optimal and nothing sleeps mid-request. | `park_competitive`, `no_park_in_request` |
+
+Everything i
+ the table is in [`proofs/`](../proofs). The proofs check the arithmetic and logic. They do not check that the C++ implements the statement, which I verified by running the engine against reference outputs instead.
+
+## Step 3: low-latency C++
+
+The practices that mattered, in the order they paid off:
+
+- the weight kernels stream with `prefetchnta`, so weights that will not be reused do not evict th
+ cache lines that will
+- one persistent thread pool; workers spin with `_mm_pause` and sleep after a budget, and a dispatch publishes a job word that includes the sequence number and the active thread count
+- the thread count adapts: 6 threads for short contexts, 8 once the context passes 1,024 tokens
+- per-thread state is aligned to 64 bytes so threads never share a cache line
+- no allocation, no
+locks and no system calls in the token loop; memory is allocated up front and optionally locked
+- work is split 7/8 static and 1/8 dynamic, so one slow thread cannot stall the end of a matrix product
+
+## Step 5: measuring fairly
+
+This is the rule that saved the most time, because this laptop's speed drifts by about **10%** during a session (clocks, thermals, other programs).
+
+- Compare two builds 
+nly in the same session, alternating A and B and rotating the order. `bench/ab.py` does exactly this.
+- A change that is supposed to be exact must produce **identical tokens**. The A/B script checks.
+- Anything under about 3 to 5% is noise here. I stopped chasing such changes.
+- Set an absolute gate as well as a relative one: a relative gain on a prompt that runs at 5 tokens per second is not prog
+ess.
+- Do not compile or run anything else during a benchmark. A compile in the background cost me one whole run.
+- Look at `top`, not at a process list from inside a sandbox, for leftover engines.
+
+## Mistakes the loop caught
+
+I am listing these because they are how the method earns its keep.
+
+- **An idle engine spinning at 500% CPU.** The thread pool never slept. It showed up only when two engin
+s were alive at once and the second one ran slower. Fixed with the spin-then-sleep budget.
+- **A hang on any prompt longer than 1,024 tokens.** A worker waking from sleep overwrote its "last seen job" counter and skipped a job that was already published. The adaptive-threads feature had been blamed for it and nearly removed.
+- **Single-prompt wins quoted as general.** One prompt gave 1.44 times Ol
+ama; across six it was 1.08. Every claim now needs the whole table.
+- **Stale baselines.** Comparing today's run with last week's number is not a comparison.
+- **My own arithmetic.** I (and the assistant) once reported a mean of 14.67 where the sum gives 14.80.
+- **Bad settings for the competitor.** My first stock-vLLM run had all threads pinned to one CPU and the next run was killed for running o
+t of memory. A baseline that is badly configured is not a result.
+
+## Learning from vLLM and Ollama
+
+I read how both serve. The ones I took: llama.cpp's spin-then-sleep polling (`--poll`), the longest-common-prefix slot choice that llama.cpp and vLLM's prefix cache both use, vLLM's incremental detokeniser that decodes only a short window per token, and the `cached_tokens` field in the usage block.
+The one I rejected is batching several tokens per streamed chunk, because the engine already emits one chunk per decode round.
+
+
+# What is left, and what I would do next
+
+## The one number I did not reach
+
+My own minimum was 25 tokens per second on every prompt. The slowest prompt (6,841 tokens) is at 24.4, which is within the noise of this laptop but not over the line. Every part of the forward p
+ss is already near its memory floor (see [RESULTS.md](RESULTS.md)), so another kernel trick cannot close it. The only lever left is **more accepted tokens per round**, which means improving the drafter.
+
+1. **Fine-tune the MTP drafter on the target text.** The drafter's top guess is right 59.8% of the time. Raising that raises tokens per round directly. It needs a GPU for a short training run, and
+it is empirical rather than provable, so it sits outside my "prove it in Lean" rule. I have not done it.
+2. **An int8 or int4 drafter.** The drafter costs 3 to 4 ms per forward pass. Quantising its weights could save about 1 ms. Small, but free.
+3. **A lower bytes-per-token model or a smaller head.** The screened head is 226 MB of the roughly 1,280 MB read per pass.
+
+## Server work
+
+The server cov
+rs text chat and completions. Not done, in the order I would do them:
+
+1. **Audio input.** The engine already has an audio tower and an `AUDIO_FEED` command in its line protocol. Wire it to the `input_audio` content part, and stream audio into the engine while the speaker is still talking so only the last chunk is processed after they stop.
+2. **Tool-call parsing.** Gemma-4 has its own tool-call f
+rmat. The chat template already renders tools, but the output is returned as plain text.
+3. **Several callers at once.** The engine serves one request at a time, and audio state is global. Real concurrency needs per-caller audio state and a scheduling policy for one set of cores.
+4. **Sampling.** Decoding is greedy because the head screen certifies the argmax. Sampling would need real logits for a
+candidate set; a top-k variant of the screen is the obvious route.
+5. **`n > 1`, `logprobs`.** Same reason as sampling.
+
+## Portability
+
+- **Zen 4 and newer Intel CPUs have VNNI and AVX-512.** The int8 path could use `vpdpbusd` and would likely be much faster. The kernels are written for AVX2 because that is all this laptop has.
+- **ARM (NEON, SVE).** Not attempted. The memory-bandwidth argument i
+ the same, so the design should carry over.
+- **Other models.** The engine is written for Gemma-4 E2B only. The ideas (certified head screen, speculative decoding with a small drafter, int8 activations over int4 weights) are not specific to it.
+
+## Measurement hygiene I would keep
+
+- One laptop is one data point. A second machine would say how much of this is the engine and how much is the machine
+
+- Memory locking and the keep-warm thread are argued from a measured refault cost and have not been tested under real memory pressure.
+
+
+# Step by step
+
+Everything here was done on Linux with an AMD Ryzen 7 7730U laptop. Where your machine differs, the notes say what to change.
+
+## 0. What you need
+
+- an x86-64 CPU with **AVX2 and FMA** (the kernels also use `-march=native`); about 12 GB of free 
+AM; about 12 GB of disk for the weights
+- `g++` 11 or newer, Python 3.10 or newer
+- optional, for the comparisons: [Ollama](https://ollama.com) with `gemma4:e2b`, and a CPU build of [vLLM](https://github.com/vllm-project/vllm)
+- optional, for the proofs: Lean 4 with Mathlib (`elan`, then `lake`)
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install transformers fastapi uvicorn openai h
+ggingface_hub numpy matplotlib
+```
+
+## 1. Get the models
+
+Two folders under `models/`. Both are Google's, under the Gemma terms, and neither is in this repository.
+
+```bash
+huggingface-cli download google/gemma-4-E2B-it-qat-w4a16-ct --local-dir models/gemma-4-E2B-it-qat
+huggingface-cli download google/gemma-4-E2B-it-assistant     --local-dir models/gemma-4-E2B-it-assistant
+```
+
+The first is the in
+4 quantisation-aware-trained checkpoint (compressed-tensors, group size 32). The second is the small MTP drafter used for speculative decoding. If the first name has changed, look in Google's Gemma-4 QAT collection on Hugging Face for the `w4a16` checkpoint of E2B.
+
+## 2. Build
+
+```bash
+./build.sh                      # -> bin/gemma4_engine
+python tools/make_index.py models/gemma-4-E2B-it-qat/mode
+.safetensors       models/engine_index.tsv
+python tools/make_index.py models/gemma-4-E2B-it-assistant/model.safetensors models/drafter_index.tsv
+```
+
+The index files list every tensor with its offset in the safetensors file, so the engine can map the weights directly.
+
+## 3. Measure your machine first
+
+```bash
+g++ -O3 -march=native -fopenmp bench/stream_bw.cpp -o /tmp/stream_bw && /tmp/stream_bw
+`
+`
+
+This prints the read bandwidth for 1 to 16 threads. Divide 1,056 MB by the best number to get the floor for one forward pass. If your machine streams faster, expect a faster engine.
+
+## 4. Pick the cores
+
+`bench/common.py` pins the engine to `0,2,4,...,14` through `ENGINE_CPUS`. That is one logical CPU per physical core on a laptop whose SMT siblings are numbered 0/1, 2/3, and so on. Check your
+ with `lscpu -e` and set `ENGINE_CPUS` to one logical CPU per physical core. Using both siblings of a core slows decode here.
+
+## 5. Make prompts and run
+
+```bash
+python bench/make_prompts.py        # writes bench/prompts/*.txt and *.ids (needs the tokenizer in models/)
+python bench/run_engine.py          # decode tok/s and cold prefill per prompt
+python bench/int8_vs_exact.py       # what the def
+ult int8 decode costs in tokens
+python bench/ab.py base=bin/gemma4_engine exact=bin/gemma4_engine:ENGINE_DECODE_INT8=0
+```
+
+The engine reads requests as lines on its standard input (`ENGINE_SERVE=1`): `N <prompt token ids>`, where `N` is the number of new tokens. It prints `FIRST <id>` after the prefill, then `GEN: ...` and a `TIMING` line. With `ENGINE_STREAM=1` it also prints `TOK <ids>` after e
+ch decode round, which is what the server uses to stream.
+
+Useful settings, all environment variables:
+
+| variable | default | meaning |
+|---|---|---|
+| `ENGINE_K` | 3 | number of drafted tokens per round |
+| `ENGINE_DECODE_INT8` | on | `0` switches to exact float decode |
+| `ENGINE_ADAPTIVE_THREADS`, `ENGINE_THREAD_CUTOFF` | off, 1024 | use 6 threads, and 8 once the context passes the cutoff |
+| 
+ENGINE_CPUS` | 0,2,4,6,8,10 | cores to pin the pool to |
+| `ENGINE_SLOTS` | 1 | prefix-cache slots (about 150 MB each at 8k context) |
+| `ENGINE_PARK_US` | 2000 | how long an idle worker spins before it sleeps |
+| `ENGINE_MLOCK`, `ENGINE_KEEPWARM` | off | lock anonymous memory; re-fault evicted weight pages while idle |
+
+## 6. Compare with Ollama and stock vLLM
+
+```bash
+python bench/ollama_bench.p
+ gemma4:e2b
+VLLM_CPU_OMP_THREADS_BIND=0,2,4,6,8,10,12,14 VLLM_CPU_KVCACHE_SPACE=1 python bench/stock_vllm_bench.py   # in a venv with vLLM CPU
+```
+
+Run all three in the same session, back to back, and do not run anything else meanwhile. Two settings cost me a failed run each on stock vLLM: `VLLM_CPU_OMP_THREADS_BIND=auto` pinned every thread to a single CPU, and a 4 GiB KV cache made the process r
+n out of memory on 15 GB.
+
+## 7. Serve it
+
+```bash
+python server/server.py serve --port 8000 --served-model-name gemma-4-e2b
+python server/test_server.py http://localhost:8000     # 25 checks with the official OpenAI client
+python server/bench_server.py http://localhost:8000
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"gemma-4-e2b","messages":[{"rol
+":"user","content":"Say hi in five words."}],"stream":true}'
+```
+
+`vllm serve`-style flags that the engine does not use are accepted and ignored with a warning. Flags that matter: `--slots 4` (conversations kept), `--max-model-len 8192`, `--engine-cpus`, `--no-mlock`, `--exact`.
+
+## 8. Charts and proofs
+
+```bash
+python bench/make_charts.py                       # rewrites charts/*.png from the num
+ers inside it
+cd proofs && lake env lean ServerLag.lean && lake env lean SlotCache.lean   # inside a Lean project that depends on Mathlib
+```
+
+The proofs import Mathlib, so they have to be compiled inside a Lake project that requires it. Lean version 4.35 with the matching Mathlib release is what they were written against.
+
+## If something looks wrong
+
+- Decode speed halves while another heavy pro
+ess runs: pin it elsewhere, or stop it. The engine's threads spin and are sensitive to being preempted.
+- The first request after a long idle is slower: the weights were evicted from memory. Raise `ulimit -l` and use `ENGINE_MLOCK=1`.
+- Your numbers differ from mine by 10%: that is normal. Run `bench/ab.py` instead of comparing across sessions.
+
+# Gemma-4 E2B on a laptop CPU: my vibe-coding attemp
+
+
+I wanted a small local language model that answers quickly on an ordinary laptop with **no GPU**: one user, one stream, short prompts, the first token as soon as possible. The obvious tools were Ollama and stock vLLM, so the goal I set was to beat both on the same machine.
+
+**This is a vibe-coding project.** I am not a kernel engineer. I set the goals and the rules, and an AI coding assistant wr
+te nearly all of the code. The rules I held it to are the interesting part, and they are written up in [docs/METHOD.md](docs/METHOD.md): pose each problem as a math problem, check the claim in Lean when it is arithmetic or logic, measure against a fair baseline in the same session, and write down every experiment that failed. I have not audited every line myself. Treat the numbers as one person's 
+easurements on one laptop.
+
+## What came out
+
+Machine: AMD Ryzen 7 7730U (Zen 3, 8 cores / 16 threads, AVX2 and FMA, no AVX-512), about 15 GB of RAM, no GPU. Model: Google's Gemma-4 E2B, int4 quantisation-aware-trained checkpoint, with Google's MTP drafter for speculative decoding.
+
+![Decode speed](charts/decode_tok_s.png)
+
+![Prefill time](charts/prefill_seconds.png)
+
+| | Ollama (`gemma4:e2b`) | s
